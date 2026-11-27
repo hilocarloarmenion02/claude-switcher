@@ -151,7 +151,7 @@ class MainActivity : Activity() {
     private fun remove(id:String){
         if(pickerOwner==id){picker?.onReceiveValue(null);picker=null;pickerOwner=null}
         pages.remove(id)?.let{stage.removeView(it);it.destroy()}
-        try{ProfileStore.getInstance().deleteProfile("workspace_"+id)}catch(e:Exception){toast("Unable to delete profile. Try again.");render();return}
+        try{if(!ProfileStore.getInstance().deleteProfile("workspace_"+id) && ProfileStore.getInstance().getAllProfileNames().contains("workspace_"+id))throw IllegalStateException("Profile still exists")}catch(e:Exception){toast("Unable to delete profile. Try again.");render();return}
         loading.remove(id);if(mutate("remove",id))render()
     }
     private fun allowed(uri:Uri):Boolean {
@@ -196,6 +196,6 @@ class MainActivity : Activity() {
     }
     override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){super.onActivityResult(requestCode,resultCode,data);if(requestCode==1001){picker?.onReceiveValue(if(pickerOwner==selected())WebChromeClient.FileChooserParams.parseResult(resultCode,data)else null);picker=null;pickerOwner=null}}
     override fun onPause(){super.onPause();pages.values.forEach{try{WebViewCompat.getProfile(it).cookieManager.flush()}catch(_:Exception){}}}
-    @Deprecated("Native back navigation") override fun onBackPressed(){val w=pages[selected()];if(w?.canGoBack()==true)w.goBack() else if(rail.visibility==View.GONE)rail.visibility=View.VISIBLE else super.onBackPressed()}
+    @Deprecated("Native back navigation") override fun onBackPressed(){val w=pages[selected()];if(w?.canGoBack()==true)w.goBack() else if(::rail.isInitialized && rail.visibility==View.GONE)rail.visibility=View.VISIBLE else super.onBackPressed()}
     override fun onDestroy(){picker?.onReceiveValue(null);pages.values.forEach{stage.removeView(it);it.destroy()};pages.clear();super.onDestroy()}
 }
