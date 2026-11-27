@@ -38,13 +38,13 @@ jobs:
       - name: Verify signature
         run: |
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose app/build/outputs/apk/debug/app-debug.apk
-          cp app/build/outputs/apk/debug/app-debug.apk ClaudeSwitcher-0.1.0-preview.apk
+          cp app/build/outputs/apk/debug/app-debug.apk ClaudeSwitcher-0.1.1-preview.apk
       - uses: actions/upload-artifact@v4
         with:
           name: ClaudeSwitcher-APK
-          path: ClaudeSwitcher-0.1.0-preview.apk
+          path: ClaudeSwitcher-0.1.1-preview.apk
       - name: Publish preview APK
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v0.1.0-preview.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT" ClaudeSwitcher-0.1.0-preview.apk --target "$GITHUB_SHA" --title "Claude Switcher 0.1.0 preview $GITHUB_RUN_NUMBER" --prerelease --notes "Debug-signed installable preview. Device login and session-isolation tests are still required. Future builds may require reinstalling if the signing key changes."
+          gh release create "v0.1.1-preview.$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT" ClaudeSwitcher-0.1.1-preview.apk --target "$GITHUB_SHA" --title "Claude Switcher 0.1.1 – floating-window fix ($GITHUB_RUN_NUMBER)" --prerelease --notes "Debug-signed installable preview. Device login and session-isolation tests are still required. Future builds may require reinstalling if the signing key changes."

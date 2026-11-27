@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Parcel
+import android.content.res.Configuration
 import android.view.Gravity
 import android.view.View
 import android.webkit.*
@@ -32,6 +34,8 @@ class MainActivity : Activity() {
     private var state = JSONObject("{\"accounts\":[],\"selected\":null}")
     private val pages = linkedMapOf<String,WebView>()
     private val loading = mutableMapOf<String,Int>()
+    // Lazy, per-profile recovery only if Android actually destroys this Activity.
+    private var savedPages = Bundle()
     private var picker: android.webkit.ValueCallback<Array<Uri>>? = null
     private var pickerOwner: String? = null
     private fun dp(n:Int) = (n*resources.displayMetrics.density+0.5f).toInt()
@@ -83,6 +87,8 @@ class MainActivity : Activity() {
         progress=ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal).apply{max=100;visibility=View.GONE}
         body.addView(progress,LinearLayout.LayoutParams(-1,dp(3)))
         stage=FrameLayout(this);body.addView(stage,LinearLayout.LayoutParams(-1,0,1f))
+        savedPages = savedInstanceState?.getBundle("web_history") ?: Bundle()
+        rail.visibility = if(savedInstanceState?.getBoolean("rail_visible",true)==false) View.GONE else View.VISIBLE
         setContentView(root)
         render()
     }
@@ -118,7 +124,10 @@ class MainActivity : Activity() {
                 val web=newPage(id)
                 pages[id]=web
                 stage.addView(web,FrameLayout.LayoutParams(-1,-1))
-                web.loadUrl(account(id)?.optString("url",home)?:home)
+                val previous = savedPages.getBundle(id)
+                savedPages.remove(id)
+                val restored = if(previous != null) try { web.restoreState(previous) != null } catch(_: Exception) { false } else false
+                if(!restored) web.loadUrl(account(id)?.optString("url",home)?:home)
             }catch(e:Exception){
                 stage.addView(TextView(this).apply{text="Could not start an isolated workspace. Update WebView and reopen the app.";setPadding(dp(20),dp(20),dp(20),0)})
             }
@@ -152,7 +161,7 @@ class MainActivity : Activity() {
         if(pickerOwner==id){picker?.onReceiveValue(null);picker=null;pickerOwner=null}
         pages.remove(id)?.let{stage.removeView(it);it.destroy()}
         try{if(!ProfileStore.getInstance().deleteProfile("workspace_"+id) && ProfileStore.getInstance().getAllProfileNames().contains("workspace_"+id))throw IllegalStateException("Profile still exists")}catch(e:Exception){toast("Unable to delete profile. Try again.");render();return}
-        loading.remove(id);if(mutate("remove",id))render()
+        loading.remove(id);savedPages.remove(id);if(mutate("remove",id))render()
     }
     private fun allowed(uri:Uri):Boolean {
         val h=uri.host?.lowercase()?:return false
@@ -179,6 +188,7 @@ class MainActivity : Activity() {
                 if(request.isForMainFrame&&request.hasGesture()&&uri.scheme=="https")openExternal(uri)
                 return true
             }
+            override fun doUpdateVisitedHistory(view:WebView,url:String?,isReload:Boolean){super.doUpdateVisitedHistory(view,url,isReload);persist(id,url)}
             override fun onPageFinished(view:WebView,url:String?){persist(id,url);try{WebViewCompat.getProfile(view).cookieManager.flush()}catch(_:Exception){}}
             override fun onRenderProcessGone(view:WebView,detail:RenderProcessGoneDetail):Boolean{
                 pages.remove(id);stage.removeView(view);view.destroy();if(selected()==id)render();return true
@@ -195,7 +205,41 @@ class MainActivity : Activity() {
         return web
     }
     override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){super.onActivityResult(requestCode,resultCode,data);if(requestCode==1001){picker?.onReceiveValue(if(pickerOwner==selected())WebChromeClient.FileChooserParams.parseResult(resultCode,data)else null);picker=null;pickerOwner=null}}
-    override fun onPause(){super.onPause();pages.values.forEach{try{WebViewCompat.getProfile(it).cookieManager.flush()}catch(_:Exception){}}}
+    // Multi-window transitions resize existing views; never reload or recreate pages here.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        pages.values.forEach { it.invalidate() }
+        if(::stage.isInitialized) stage.requestLayout()
+    }
+    override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: Configuration) {
+        super.onMultiWindowModeChanged(isInMultiWindowMode,newConfig)
+        pages.values.forEach { it.invalidate() }
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        if(!::rail.isInitialized) return
+        outState.putBoolean("rail_visible",rail.visibility==View.VISIBLE)
+        val histories=Bundle()
+        // Keep the active workspace first and bound total state size to avoid Binder failures.
+        val ids=entries().map{it.getString("id")}.sortedBy{if(it==selected()) 0 else 1}
+        var remaining=256*1024
+        for(id in ids) {
+            val history=try {
+                val web=pages[id]
+                if(web!=null) Bundle().also{web.saveState(it)} else savedPages.getBundle(id)
+            } catch(_:Exception) { null } ?: continue
+            val parcel=Parcel.obtain()
+            val bytes=try { parcel.writeBundle(history);parcel.dataSize() } catch(_:Exception) { Int.MAX_VALUE } finally {parcel.recycle()}
+            if(bytes<=remaining) { histories.putBundle(id,history);remaining-=bytes }
+        }
+        outState.putBundle("web_history",histories)
+    }
+    override fun onPause(){
+        super.onPause()
+        pages.forEach{(id,web)->
+            try{persist(id,web.url);WebViewCompat.getProfile(web).cookieManager.flush()}catch(_:Exception){}
+        }
+    }
     @Deprecated("Native back navigation") override fun onBackPressed(){val w=pages[selected()];if(w?.canGoBack()==true)w.goBack() else if(::rail.isInitialized && rail.visibility==View.GONE)rail.visibility=View.VISIBLE else super.onBackPressed()}
     override fun onDestroy(){picker?.onReceiveValue(null);pages.values.forEach{stage.removeView(it);it.destroy()};pages.clear();super.onDestroy()}
 }
