@@ -3,6 +3,10 @@ package com.claudeswitcher.app
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.MutableContextWrapper
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -20,7 +24,7 @@ import java.util.UUID
 import org.json.JSONObject
 
 class MainActivity : Activity() {
-    private val home = "https://claude.ai/"
+    private val home = "https://claude.ai/new"
     private val bg = Color.rgb(26,22,38)
     private val panel = Color.rgb(37,30,55)
     private val accent = Color.rgb(255,155,101)
@@ -34,6 +38,13 @@ class MainActivity : Activity() {
     private var state = JSONObject("{\"accounts\":[],\"selected\":null}")
     private val pages = linkedMapOf<String,WebView>()
     private val loading = mutableMapOf<String,Int>()
+    private val errors = mutableMapOf<String,String>()
+    private val pendingChecks = mutableMapOf<String,Runnable>()
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var notice: LinearLayout
+    private lateinit var noticeText: TextView
+    private var retainPages = false
+    private data class Retained(val pages: LinkedHashMap<String,WebView>,val loading: Map<String,Int>,val errors: Map<String,String>,val railVisible:Boolean)
     // Lazy, per-profile recovery only if Android actually destroys this Activity.
     private var savedPages = Bundle()
     private var picker: android.webkit.ValueCallback<Array<Uri>>? = null
@@ -81,15 +92,37 @@ class MainActivity : Activity() {
         header.addView(button("☰","Toggle account sidebar"){rail.visibility=if(rail.visibility==View.VISIBLE)View.GONE else View.VISIBLE})
         title=TextView(this).apply{textSize=16f;setTextColor(Color.WHITE);isSingleLine=true;ellipsize=android.text.TextUtils.TruncateAt.END;setPadding(dp(8),0,dp(4),0);setOnClickListener{quickSwitch()}}
         header.addView(title,LinearLayout.LayoutParams(0,dp(48),1f))
-        header.addView(button("↻","Reload current page"){pages[selected()]?.reload()})
+        header.addView(button("↻","Retry current page"){retry()})
         header.addView(button("⋮","Manage account"){manage()})
         body.addView(header,LinearLayout.LayoutParams(-1,dp(54)))
         progress=ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal).apply{max=100;visibility=View.GONE}
         body.addView(progress,LinearLayout.LayoutParams(-1,dp(3)))
+        notice=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL;setBackgroundColor(panel);visibility=View.GONE;setPadding(dp(8),dp(4),dp(4),dp(4))}
+        noticeText=TextView(this).apply{textSize=13f;setTextColor(Color.WHITE)}
+        notice.addView(noticeText,LinearLayout.LayoutParams(0,-2,1f))
+        notice.addView(button("↻","Retry loading"){retry()})
+        notice.addView(button("×","Dismiss loading notice"){selected()?.let{errors.remove(it)};updateStatus()})
+        body.addView(notice,LinearLayout.LayoutParams(-1,-2))
         stage=FrameLayout(this);body.addView(stage,LinearLayout.LayoutParams(-1,0,1f))
         savedPages = savedInstanceState?.getBundle("web_history") ?: Bundle()
         rail.visibility = if(savedInstanceState?.getBoolean("rail_visible",true)==false) View.GONE else View.VISIBLE
         setContentView(root)
+        val retained=lastNonConfigurationInstance as? Retained
+        if(retained!=null){
+            rail.visibility=if(retained.railVisible) View.VISIBLE else View.GONE
+            loading.putAll(retained.loading);errors.putAll(retained.errors)
+            retained.pages.forEach{(id,web)->
+                if(account(id)==null){web.destroy()} else {
+                    (web.context as MutableContextWrapper).baseContext=this
+                    (web.parent as? android.view.ViewGroup)?.removeView(web)
+                    bindPage(id,web)
+                    web.visibility=View.GONE
+                    pages[id]=web;stage.addView(web,FrameLayout.LayoutParams(-1,-1));savedPages.remove(id)
+                    scheduleCheck(id,web,15000L)
+                }
+            }
+            Log.i("ClaudeSwitcher","Reattached "+pages.size+" live workspaces")
+        }
         render()
     }
     private fun renderRail() {
@@ -107,7 +140,7 @@ class MainActivity : Activity() {
         val id=selected()
         title.text=account(id)?.optString("name")?:"Claude Switcher"
         title.gravity=Gravity.CENTER_VERTICAL
-        pages.values.forEach{it.visibility=View.GONE}
+        pages.forEach{(key,web)->web.visibility=if(key==id) View.VISIBLE else View.GONE}
         if(id==null){
             stage.removeAllViews();stage.addView(LinearLayout(this).apply{
                 orientation=LinearLayout.VERTICAL;gravity=Gravity.CENTER;setPadding(dp(20),0,dp(20),0)
@@ -115,10 +148,10 @@ class MainActivity : Activity() {
                 addView(TextView(this@MainActivity).apply{text="Add an account to sign in on Claude’s website. Each workspace has its own browser profile.";gravity=Gravity.CENTER;setPadding(0,dp(12),0,dp(16))})
                 addView(button("+ Add account","Add first account"){promptAdd()})
             },FrameLayout.LayoutParams(-1,-1))
-            progress.visibility=View.GONE;return
+            updateStatus();return
         }
         val existing=pages[id]
-        if(existing==null) {
+        if(existing==null && !errors.containsKey(id)) {
             stage.childrenToRemove()
             try {
                 val web=newPage(id)
@@ -127,12 +160,57 @@ class MainActivity : Activity() {
                 val previous = savedPages.getBundle(id)
                 savedPages.remove(id)
                 val restored = if(previous != null) try { web.restoreState(previous) != null } catch(_: Exception) { false } else false
-                if(!restored) web.loadUrl(account(id)?.optString("url",home)?:home)
+                if(!restored) web.loadUrl(startUrl(id))
+                scheduleCheck(id,web,20000L)
             }catch(e:Exception){
-                stage.addView(TextView(this).apply{text="Could not start an isolated workspace. Update WebView and reopen the app.";setPadding(dp(20),dp(20),dp(20),0)})
+                errors[id]="Could not start an isolated workspace. Update Android System WebView or retry."
             }
-        }else {existing.visibility=View.VISIBLE}
-        val p=loading[id]?:100;progress.progress=p;progress.visibility=if(p<100)View.VISIBLE else View.GONE
+        }else if(existing!=null) {existing.visibility=View.VISIBLE}
+        updateStatus()
+    }
+    private fun startUrl(id:String):String {
+        val url=account(id)?.optString("url",home)?:home
+        return if(url=="https://claude.ai/"||url=="https://claude.ai") home else url
+    }
+    private fun updateStatus(){
+        if(!::notice.isInitialized)return
+        val id=selected()
+        val error=errors[id]
+        noticeText.text=error.orEmpty()
+        notice.visibility=if(error!=null)View.VISIBLE else View.GONE
+        val p=loading[id]?:100
+        progress.progress=p
+        progress.visibility=if(id!=null&&error==null&&p<100)View.VISIBLE else View.GONE
+    }
+    private fun cancelCheck(id:String){pendingChecks.remove(id)?.let{handler.removeCallbacks(it)}}
+    private fun scheduleCheck(id:String,web:WebView,delay:Long){
+        cancelCheck(id)
+        val task=Runnable {
+            pendingChecks.remove(id)
+            if(pages[id]!==web||errors.containsKey(id))return@Runnable
+            if((loading[id]?:100)<100){
+                errors[id]="Claude is taking longer than expected. Retry if it stays blank."
+                updateStatus()
+            }else if(web.visibility==View.VISIBLE){
+                // Inspect only an empty-page boolean; do not read or store chat text or drafts.
+                web.evaluateJavascript("(function(){return !!document.body && !document.body.innerText.trim() && !document.body.querySelector('input,textarea,button,canvas,iframe,video');})()"){empty->
+                    if(empty=="true"&&pages[id]===web&&!errors.containsKey(id)){
+                        errors[id]="The page loaded without visible content. Tap retry.";updateStatus()
+                    }
+                }
+            }
+        }
+        pendingChecks[id]=task;handler.postDelayed(task,delay)
+    }
+    private fun retry(){
+        val id=selected()?:return
+        errors.remove(id);loading[id]=0
+        val web=pages[id]
+        if(web==null){render();return}
+        updateStatus()
+        val url=web.url
+        if(url==null||url=="about:blank"||url=="https://claude.ai/")web.loadUrl(startUrl(id)) else web.reload()
+        scheduleCheck(id,web,20000L)
     }
     private fun FrameLayout.childrenToRemove(){for(i in childCount-1 downTo 0)if(getChildAt(i) !is WebView)removeViewAt(i)}
     private fun choose(id:String){if(id!=selected()){picker?.onReceiveValue(null);picker=null;pickerOwner=null;if(mutate("select",id))render()}}
@@ -161,7 +239,7 @@ class MainActivity : Activity() {
         if(pickerOwner==id){picker?.onReceiveValue(null);picker=null;pickerOwner=null}
         pages.remove(id)?.let{stage.removeView(it);it.destroy()}
         try{if(!ProfileStore.getInstance().deleteProfile("workspace_"+id) && ProfileStore.getInstance().getAllProfileNames().contains("workspace_"+id))throw IllegalStateException("Profile still exists")}catch(e:Exception){toast("Unable to delete profile. Try again.");render();return}
-        loading.remove(id);savedPages.remove(id);if(mutate("remove",id))render()
+        loading.remove(id);errors.remove(id);cancelCheck(id);savedPages.remove(id);if(mutate("remove",id))render()
     }
     private fun allowed(uri:Uri):Boolean {
         val h=uri.host?.lowercase()?:return false
@@ -178,31 +256,64 @@ class MainActivity : Activity() {
     }
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
     private fun newPage(id:String):WebView {
-        val web=WebView(this)
+        val web=WebView(MutableContextWrapper(this))
         WebViewCompat.setProfile(web,"workspace_"+id)
         web.settings.apply{javaScriptEnabled=true;domStorageEnabled=true;allowFileAccess=false;allowContentAccess=false;mixedContentMode=WebSettings.MIXED_CONTENT_NEVER_ALLOW;setSupportMultipleWindows(false);javaScriptCanOpenWindowsAutomatically=false}
+        bindPage(id,web)
+        return web
+    }
+    private fun bindPage(id:String,web:WebView){
         web.webViewClient=object:WebViewClient(){
             override fun shouldOverrideUrlLoading(view:WebView,request:WebResourceRequest):Boolean{
                 val uri=request.url
+                // A navigation callback can also be for an embedded frame (e.g. normal sign-in widgets).
+                // Let Chromium enforce iframe origin, HTTPS and content policies itself.
+                if(!request.isForMainFrame)return uri.scheme !in listOf("https","about","data","blob")
                 if(allowed(uri))return false
-                if(request.isForMainFrame&&request.hasGesture()&&uri.scheme=="https")openExternal(uri)
+                if(request.hasGesture()&&uri.scheme=="https")openExternal(uri)
+                else if(uri.scheme=="https"){
+                    errors[id]="A redirect to "+(uri.host?:"another website")+" was blocked. Retry or use a supported Claude login method."
+                    updateStatus()
+                }
                 return true
             }
             override fun doUpdateVisitedHistory(view:WebView,url:String?,isReload:Boolean){super.doUpdateVisitedHistory(view,url,isReload);persist(id,url)}
-            override fun onPageFinished(view:WebView,url:String?){persist(id,url);try{WebViewCompat.getProfile(view).cookieManager.flush()}catch(_:Exception){}}
+            override fun onPageStarted(view:WebView,url:String?,favicon:android.graphics.Bitmap?){
+                errors.remove(id);loading[id]=0;updateStatus();scheduleCheck(id,view,20000L)
+            }
+            override fun onPageCommitVisible(view:WebView,url:String?){
+                if(errors[id]?.startsWith("Claude is taking longer")==true)errors.remove(id)
+                updateStatus()
+            }
+            override fun onPageFinished(view:WebView,url:String?){
+                persist(id,url)
+                if(errors[id]?.startsWith("Claude is taking longer")==true)errors.remove(id)
+                loading[id]=100;updateStatus();scheduleCheck(id,view,8000L)
+                try{WebViewCompat.getProfile(view).cookieManager.flush()}catch(_:Exception){}
+            }
+            override fun onReceivedError(view:WebView,request:WebResourceRequest,error:WebResourceError){
+                if(request.isForMainFrame){errors[id]="Could not load Claude ("+error.errorCode+"). "+error.description;cancelCheck(id);updateStatus()}
+            }
+            override fun onReceivedHttpError(view:WebView,request:WebResourceRequest,response:WebResourceResponse){
+                if(request.isForMainFrame){errors[id]="Claude returned HTTP "+response.statusCode+". Retry when available.";cancelCheck(id);updateStatus()}
+            }
+            override fun onReceivedSslError(view:WebView,handler:SslErrorHandler,error:android.net.http.SslError){
+                handler.cancel();errors[id]="A secure connection could not be established. Check your connection and device time.";cancelCheck(id);updateStatus()
+            }
             override fun onRenderProcessGone(view:WebView,detail:RenderProcessGoneDetail):Boolean{
-                pages.remove(id);stage.removeView(view);view.destroy();if(selected()==id)render();return true
+                if(pages[id]===view)pages.remove(id)
+                cancelCheck(id);stage.removeView(view);view.destroy();loading.remove(id)
+                errors[id]="Android stopped the browser renderer. Tap retry to restore this workspace.";updateStatus();return true
             }
         }
         web.webChromeClient=object:WebChromeClient(){
-            override fun onProgressChanged(view:WebView,p:Int){loading[id]=p;if(selected()==id){progress.progress=p;progress.visibility=if(p<100)View.VISIBLE else View.GONE}}
+            override fun onProgressChanged(view:WebView,p:Int){loading[id]=p;updateStatus()}
             override fun onShowFileChooser(view:WebView,callback:ValueCallback<Array<Uri>>,params:FileChooserParams):Boolean{
                 if(selected()!=id)return false
                 picker?.onReceiveValue(null);picker=callback;pickerOwner=id
                 return try{startActivityForResult(params.createIntent(),1001);true}catch(e:Exception){picker=null;pickerOwner=null;false}
             }
         }
-        return web
     }
     override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){super.onActivityResult(requestCode,resultCode,data);if(requestCode==1001){picker?.onReceiveValue(if(pickerOwner==selected())WebChromeClient.FileChooserParams.parseResult(resultCode,data)else null);picker=null;pickerOwner=null}}
     // Multi-window transitions resize existing views; never reload or recreate pages here.
@@ -241,5 +352,23 @@ class MainActivity : Activity() {
         }
     }
     @Deprecated("Native back navigation") override fun onBackPressed(){val w=pages[selected()];if(w?.canGoBack()==true)w.goBack() else if(::rail.isInitialized && rail.visibility==View.GONE)rail.visibility=View.VISIBLE else super.onBackPressed()}
-    override fun onDestroy(){picker?.onReceiveValue(null);pages.values.forEach{stage.removeView(it);it.destroy()};pages.clear();super.onDestroy()}
+    @Suppress("DEPRECATION")
+    override fun onRetainNonConfigurationInstance():Any? {
+        if(!::stage.isInitialized)return null
+        retainPages=true
+        return Retained(LinkedHashMap(pages),HashMap(loading),HashMap(errors),rail.visibility==View.VISIBLE)
+    }
+    override fun onDestroy(){
+        handler.removeCallbacksAndMessages(null);pendingChecks.clear()
+        picker?.onReceiveValue(null);picker=null;pickerOwner=null
+        pages.values.forEach{web->
+            (web.parent as? android.view.ViewGroup)?.removeView(web)
+            if(retainPages){
+                // Break callbacks to the old Activity; the next instance rebinds them.
+                web.webViewClient=WebViewClient();web.webChromeClient=WebChromeClient()
+                (web.context as MutableContextWrapper).baseContext=applicationContext
+            }else web.destroy()
+        }
+        pages.clear();super.onDestroy()
+    }
 }
